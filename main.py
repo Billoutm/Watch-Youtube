@@ -32,6 +32,7 @@ elif not GEMINI_API_KEY:
 # ============================================================
 
 GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_FALLBACK_MODELS = ["gemini-3.7-flash"]  # essayé si GEMINI_MODEL reste surchargé après toutes les tentatives
 
 # Durée des tranches et résolution : adaptées selon la disponibilité de sous-titres officiels
 # (si on les a, Gemini n'a plus besoin de deviner les paroles -> on peut baisser la résolution
@@ -55,6 +56,8 @@ OVERLOAD_MAX_DELAY = 240
 DEFAULT_CATEGORY = "Divers"
 CACHE_DIR = "video_cache"
 MIGRATION_FAILURES_FILE = "migration_failures.json"  # uniquement les compteurs d'échecs (pas le statut "fait")
+CHANNELS_DATABASE_ID = os.getenv("CHANNELS_DATABASE_ID")  # optionnel : onglet "Historique chaînes"
+BACKFILL_STATE_FILE = "channel_backfill_state.json"
 LOG_FILE = "app_log.txt"
 LANG_INSTRUCTION = "IMPORTANT : quelle que soit la langue parlée dans la vidéo (français, anglais, etc.), tu dois TOUJOURS répondre en français."
 
@@ -807,27 +810,38 @@ def call_gemini(contents, log_fn, stop_event, max_output_tokens=2000, temperatur
         config_kwargs["media_resolution"] = getattr(types.MediaResolution, media_resolution)
     config = types.GenerateContentConfig(**config_kwargs)
 
+    models_to_try = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     last_error = None
-    for attempt in range(1, retries + 2):
-        response = call_with_overload_protection(
-            lambda: gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config),
-            stop_event, log_fn, "analyse Gemini"
-        )
-        text, error = extract_response_text(response)
-        if error:
-            if is_quota_error(error):
-                raise QuotaExceededError(error)
-            last_error = error
-            interruptible_sleep(2 * attempt, stop_event)
-            continue
 
-        data = extract_json(text)
-        if data:
-            return data
-        last_error = "JSON introuvable dans la réponse"
-        interruptible_sleep(2 * attempt, stop_event)
+    for model_name in models_to_try:
+        try:
+            for attempt in range(1, retries + 2):
+                response = call_with_overload_protection(
+                    lambda: gemini_client.models.generate_content(model=model_name, contents=contents, config=config),
+                    stop_event, log_fn, f"analyse Gemini ({model_name})"
+                )
+                text, error = extract_response_text(response)
+                if error:
+                    if is_quota_error(error):
+                        raise QuotaExceededError(error)
+                    last_error = error
+                    interruptible_sleep(2 * attempt, stop_event)
+                    continue
 
-    log_fn(f"      ❌ Échec définitif après {retries + 1} essai(s) : {last_error}")
+                data = extract_json(text)
+                if data:
+                    return data
+                last_error = "JSON introuvable dans la réponse"
+                interruptible_sleep(2 * attempt, stop_event)
+        except ServiceOverloadedError as e:
+            last_error = str(e)
+            if model_name != models_to_try[-1]:
+                next_model = models_to_try[models_to_try.index(model_name) + 1]
+                log_fn(f"      🔀 {model_name} indisponible (surcharge persistante), bascule sur {next_model}...")
+                continue
+            raise  # dernier modèle de la liste : on laisse l'appelant gérer la pause
+
+    log_fn(f"      ❌ Échec définitif sur tous les modèles essayés ({', '.join(models_to_try)}) : {last_error}")
     return None
 
 
@@ -1164,6 +1178,111 @@ def apply_primary_subject_to_page(page_id, video_url, subject, transcription_pro
 
     update_page_properties(page_id, title, video_type, all_sources, log_fn)
     return replace_page_content(page_id, summary, a_retenir, transcription_propre, all_sources, log_fn, updated=True)
+
+
+# ============================================================
+# CHAÎNES YOUTUBE (lecture base "Chaînes YouTube" + listing historique)
+# ============================================================
+
+def list_watched_channels(channels_ds_id, log_fn):
+    pages = []
+    payload = {"page_size": 100}
+    while True:
+        response = notion_request("POST", f"https://api.notion.com/v1/data_sources/{channels_ds_id}/query",
+                                  log_fn, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+
+    channels = []
+    for page in pages:
+        props = page.get("properties", {})
+        title_list = props.get("Nom", {}).get("title", [])
+        name = title_list[0]["text"]["content"] if title_list else "Sans nom"
+        channel_url = props.get("Chaîne", {}).get("url")
+        active = bool(props.get("Actif", {}).get("checkbox"))
+        channels.append({"page_id": page["id"], "name": name, "channel_url": channel_url, "active": active})
+    return channels
+
+
+def get_channel_all_videos(channel_url, log_fn):
+    """Liste TOUTES les vidéos d'une chaîne (titre + id, pas de description) via yt-dlp
+    en mode liste à plat : rapide, gratuit, zéro quota Gemini. Peut renvoyer des centaines
+    d'entrées pour une grosse chaîne."""
+    target = (channel_url or "").rstrip("/")
+    if target and not target.endswith("/videos"):
+        target += "/videos"
+    try:
+        result = subprocess.run(["yt-dlp", "--flat-playlist", "-J", target],
+                                capture_output=True, text=True, check=True, timeout=180)
+        data = json.loads(result.stdout)
+        entries = data.get("entries") or []
+        videos = []
+        for e in entries:
+            vid = e.get("id")
+            if not vid:
+                continue
+            videos.append({
+                "video_id": vid,
+                "title": e.get("title") or "Sans titre",
+                "url": f"https://www.youtube.com/watch?v={vid}",
+            })
+        return videos
+    except Exception as e:
+        log_fn(f"⚠️ Impossible de lister les vidéos de la chaîne : {e}")
+        return []
+
+
+def triage_video_worth_it(title, description, log_fn, stop_event):
+    """Même logique de tri que la surveillance quotidienne : contenu pertinent pour le
+    projet, ET uniquement DaVinci Resolve (les vidéos sur un autre logiciel de montage
+    précis sont écartées avant tout traitement coûteux)."""
+    prompt = f"""Tu aides à filtrer automatiquement des vidéos YouTube pour un projet personnel
+d'archivage de connaissances sur l'audiovisuel (montage, étalonnage, son, effets, storytelling, etc.).
+{LANG_INSTRUCTION}
+
+TITRE : {title}
+DESCRIPTION : {description[:500] if description else "(non disponible)"}
+
+TÂCHE 1 (contenu) : cette vidéo a-t-elle un contenu éducatif/technique qui mérite d'être archivé et
+analysé en détail (tutoriel, explication technique, retour d'expérience, comparatif...) ?
+Réponds NON si c'est une simple annonce, un vlog sans contenu technique, une vidéo communautaire,
+un live replay sans substance, ou du contenu publicitaire/sponsorisé pur.
+
+TÂCHE 2 (logiciel) : seul DaVinci Resolve est utilisé par la personne qui archive. Si le titre ou
+la description mentionne clairement un AUTRE logiciel de montage précis (Premiere Pro, Final Cut
+Pro, Avid Media Composer, CapCut, Vegas Pro, etc.) sans mentionner Resolve, cette vidéo n'est PAS
+pertinente. Si aucun logiciel précis n'est mentionné, ou si Resolve est mentionné, c'est pertinent.
+
+Réponds UNIQUEMENT en JSON, sans aucun texte avant ou après :
+{{"vaut_le_coup": true ou false, "raison": "explication très courte", "autre_logiciel_detecte": "nom du logiciel si un AUTRE logiciel précis a été détecté, sinon chaîne vide"}}"""
+
+    data = call_gemini(prompt, log_fn, stop_event, max_output_tokens=200, temperature=0.1)
+    if not data:
+        return True, "Tri impossible (réponse invalide), traitée par défaut par précaution"
+
+    autre_logiciel = (data.get("autre_logiciel_detecte") or "").strip()
+    if autre_logiciel:
+        return False, f"Logiciel non pertinent détecté : {autre_logiciel} (seul DaVinci Resolve est suivi)"
+    return bool(data.get("vaut_le_coup", True)), data.get("raison", "")
+
+
+def load_backfill_state():
+    if os.path.isfile(BACKFILL_STATE_FILE):
+        try:
+            with open(BACKFILL_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_backfill_state(state):
+    with open(BACKFILL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 # ============================================================
@@ -1589,6 +1708,272 @@ class MigrationTab(ctk.CTkFrame):
 
 
 # ============================================================
+# ONGLET 3 : HISTORIQUE DES CHAÎNES YOUTUBE
+# ============================================================
+
+class HistoryTab(ctk.CTkFrame):
+    def __init__(self, master, app_lock):
+        super().__init__(master, fg_color="transparent")
+        self.app_lock = app_lock
+        self.stop_event = threading.Event()
+        self.session_start_time = None
+        self.session_done = 0
+
+        ctk.CTkLabel(
+            self,
+            text="Récupère tout l'historique des chaînes YouTube actives (base \"Chaînes YouTube\").\n"
+                 "Chaque vidéo passe d'abord par un tri IA léger (pertinence + DaVinci Resolve "
+                 "uniquement) avant le traitement complet, pour ne pas gaspiller de quota.",
+            font=ctk.CTkFont(size=12), text_color="gray", justify="center", wraplength=660
+        ).pack(pady=(15, 15))
+
+        stats_frame = ctk.CTkFrame(self)
+        stats_frame.pack(fill="x", padx=20, pady=(0, 15))
+        self.stat_labels = {}
+        for key, label in [("total", "Total"), ("added", "Ajoutées"), ("skipped", "Ignorées"), ("remaining", "Restantes")]:
+            col = ctk.CTkFrame(stats_frame, fg_color="transparent")
+            col.pack(side="left", expand=True, fill="both", padx=10, pady=10)
+            value_label = ctk.CTkLabel(col, text="-", font=ctk.CTkFont(size=20, weight="bold"))
+            value_label.pack()
+            ctk.CTkLabel(col, text=label, font=ctk.CTkFont(size=11), text_color="gray").pack()
+            self.stat_labels[key] = value_label
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 10))
+        self.start_btn = ctk.CTkButton(btn_frame, text="🚀 Lancer / Reprendre", command=self.start,
+                                       height=42, font=ctk.CTkFont(size=14, weight="bold"),
+                                       fg_color="#2563eb", hover_color="#1d4ed8")
+        self.start_btn.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        self.stop_btn = ctk.CTkButton(btn_frame, text="⏸️ Arrêter", command=self.request_stop,
+                                      height=42, font=ctk.CTkFont(size=14, weight="bold"),
+                                      fg_color="#78716c", hover_color="#57534e", state="disabled")
+        self.stop_btn.pack(side="left", expand=True, fill="x", padx=5)
+
+        btn_frame2 = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame2.pack(fill="x", padx=20, pady=(0, 15))
+        self.retry_btn = ctk.CTkButton(btn_frame2, text="🔁 Réessayer les échecs", command=self.retry_failed,
+                                       height=36, font=ctk.CTkFont(size=13), fg_color="#0d9488", hover_color="#0f766e")
+        self.retry_btn.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        self.reset_btn = ctk.CTkButton(btn_frame2, text="🗑️ Réinitialiser l'historique", command=self.reset_state,
+                                       height=36, font=ctk.CTkFont(size=13), fg_color="#b91c1c", hover_color="#991b1b")
+        self.reset_btn.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.progress_bar = ctk.CTkProgressBar(self, width=660, height=20, corner_radius=10)
+        self.progress_bar.pack(padx=20, pady=(0, 8))
+        self.progress_bar.set(0)
+        self.progress_label = ctk.CTkLabel(self, text="En attente...", font=ctk.CTkFont(size=12), text_color="gray")
+        self.progress_label.pack()
+
+        ctk.CTkLabel(self, text="Logs :", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=20, pady=(10, 5))
+        self.log_text = ctk.CTkTextbox(self, width=660, height=190, font=ctk.CTkFont(size=12, family="Consolas"), corner_radius=10)
+        self.log_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        self.log_text.configure(state="disabled")
+
+        self.log = make_logger(self.log_text, self)
+        self.refresh_stats_display()
+
+    def update_progress(self, value, label):
+        self.progress_bar.set(max(0, min(value, 100)) / 100)
+        self.progress_label.configure(text=label)
+        if "Erreur" in label or "atteint" in label or "surchargé" in label or "pause" in label.lower():
+            self.progress_label.configure(text_color="#ef4444")
+        elif "✅" in label:
+            self.progress_label.configure(text_color="#22c55e")
+        else:
+            self.progress_label.configure(text_color="gray")
+        self.update()
+
+    def refresh_stats_display(self, total=None, added=None, skipped=None, remaining=None):
+        self.stat_labels["total"].configure(text=str(total) if total is not None else "-")
+        self.stat_labels["added"].configure(text=str(added) if added is not None else "-")
+        self.stat_labels["skipped"].configure(text=str(skipped) if skipped is not None else "-")
+        self.stat_labels["remaining"].configure(text=str(remaining) if remaining is not None else "-")
+        self.update()
+
+    def estimate_time_label(self, done_this_session, remaining):
+        if done_this_session == 0 or self.session_start_time is None:
+            return ""
+        elapsed = (datetime.now() - self.session_start_time).total_seconds()
+        eta = timedelta(seconds=int((elapsed / done_this_session) * remaining))
+        return f" (≈ {str(eta)} restant)"
+
+    def start(self):
+        if not CHANNELS_DATABASE_ID:
+            messagebox.showerror("Erreur", "CHANNELS_DATABASE_ID n'est pas défini dans le .env.")
+            return
+        if not self.app_lock.acquire("history"):
+            messagebox.showwarning("Occupé", "Un autre traitement est en cours dans un autre onglet.")
+            return
+        self.stop_event.clear()
+        self.start_btn.configure(state="disabled")
+        self.retry_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal", text="⏸️ Arrêter")
+        self.session_start_time = datetime.now()
+        self.session_done = 0
+        threading.Thread(target=self.run_backfill, daemon=True).start()
+
+    def request_stop(self):
+        self.stop_event.set()
+        self.stop_btn.configure(state="disabled", text="⏳ Arrêt en cours...")
+
+    def retry_failed(self):
+        state = load_backfill_state()
+        reset_count = 0
+        for ch_state in state.values():
+            reset_count += len(ch_state.get("attempts", {}))
+            ch_state["attempts"] = {}
+        save_backfill_state(state)
+        self.log(f"🔁 {reset_count} vidéo(s) en échec repassée(s) en attente.")
+
+    def reset_state(self):
+        if not messagebox.askyesno("Confirmation",
+                                   "Tout l'historique de progression sera effacé : toutes les vidéos des "
+                                   "chaînes actives seront re-triées depuis le début. Continuer ?"):
+            return
+        if os.path.isfile(BACKFILL_STATE_FILE):
+            os.remove(BACKFILL_STATE_FILE)
+        self.log("🗑️ Historique réinitialisé.")
+        self.refresh_stats_display()
+
+    def run_backfill(self):
+        try:
+            if not check_dependencies(self.log):
+                return
+            if not test_connections(self.log, self.stop_event):
+                return
+
+            data_source_id = get_data_source_id(DATABASE_ID, self.log)
+            channels_ds_id = get_data_source_id(CHANNELS_DATABASE_ID, self.log)
+            channels = [c for c in list_watched_channels(channels_ds_id, self.log) if c["active"] and c["channel_url"]]
+            self.log(f"📺 {len(channels)} chaîne(s) active(s).")
+
+            state = load_backfill_state()
+            all_items = []
+            added_so_far = 0
+            skipped_so_far = 0
+
+            for channel in channels:
+                self.log(f"\n🔎 Listing des vidéos : {channel['name']}...")
+                videos = get_channel_all_videos(channel["channel_url"], self.log)
+                self.log(f"   {len(videos)} vidéo(s) trouvée(s) sur la chaîne.")
+
+                ch_state = state.setdefault(channel["page_id"], {"done": {}, "attempts": {}})
+                for status in ch_state["done"].values():
+                    if status == "added":
+                        added_so_far += 1
+                    elif status in ("skipped", "already_exists"):
+                        skipped_so_far += 1
+
+                for v in videos:
+                    if v["video_id"] in ch_state["done"]:
+                        continue
+                    if ch_state["attempts"].get(v["video_id"], 0) >= MAX_FAILED_ATTEMPTS:
+                        continue
+                    all_items.append((channel, v, ch_state))
+
+            save_backfill_state(state)
+            total = len(all_items) + added_so_far + skipped_so_far
+            self.refresh_stats_display(total, added_so_far, skipped_so_far, len(all_items))
+            self.log(f"\n✅ {len(all_items)} vidéo(s) restante(s) à examiner sur {total} au total.")
+
+            for index, (channel, video, ch_state) in enumerate(all_items, 1):
+                if self.stop_event.is_set():
+                    self.log("\n⏸️ Arrêt demandé, traitement mis en pause proprement.")
+                    self.update_progress((added_so_far + skipped_so_far) / total * 100 if total else 0, "⏸️ En pause (arrêt manuel)")
+                    return
+
+                eta = self.estimate_time_label(self.session_done, len(all_items) - index + 1)
+                self.update_progress((added_so_far + skipped_so_far) / total * 100 if total else 0,
+                                     f"Vidéo {index}/{len(all_items)}{eta}")
+                self.log(f"\n➡️ [{index}/{len(all_items)}] ({channel['name']}) {video['title']}")
+
+                existing = find_page_by_source_url(data_source_id, video["url"], self.log)
+                if existing:
+                    self.log(f"   ℹ️ Déjà présente dans Notion : « {existing['title']} »")
+                    ch_state["done"][video["video_id"]] = "already_exists"
+                    save_backfill_state(state)
+                    skipped_so_far += 1
+                    continue
+
+                work_id = get_work_id_for_url(video["url"])
+                try:
+                    worth_it, reason = triage_video_worth_it(video["title"], "", self.log, self.stop_event)
+                    if not worth_it:
+                        self.log(f"   ⏭️ Ignorée : {reason}")
+                        ch_state["done"][video["video_id"]] = "skipped"
+                        save_backfill_state(state)
+                        skipped_so_far += 1
+                        self.session_done += 1
+                        continue
+
+                    self.log(f"   ✅ Retenue : {reason}")
+                    metadata = get_video_metadata(video["url"], self.log)
+                    captions_text = try_fetch_captions(work_id, video["url"], self.log)
+                    if captions_text:
+                        chunk_duration, media_resolution = CHUNK_DURATION_WITH_CAPTIONS, MEDIA_RESOLUTION_WITH_CAPTIONS
+                    else:
+                        chunk_duration, media_resolution = CHUNK_DURATION_NO_CAPTIONS, MEDIA_RESOLUTION_NO_CAPTIONS
+
+                    video_path, video_title = download_video_cached(work_id, video["url"], video["title"], self.log)
+                    if not video_path:
+                        raise RuntimeError("Échec du téléchargement")
+
+                    sujets, transcription = analyze_full_video_cached(
+                        work_id, video_path, video_title, metadata.get("description", ""), captions_text,
+                        chunk_duration, media_resolution, self.log, self.stop_event
+                    )
+                    for subject in sujets:
+                        process_one_subject(video["url"], subject, transcription, data_source_id, self.log, self.stop_event)
+
+                    clear_work(work_id)
+                    ch_state["done"][video["video_id"]] = "added"
+                    save_backfill_state(state)
+                    added_so_far += 1
+                    self.session_done += 1
+                    self.log("   ✅ Ajoutée à Notion.")
+
+                except QuotaExceededError as e:
+                    self.log(f"\n⏳ Quota Gemini atteint : {e}")
+                    self.log("💡 Le travail déjà fait est sauvegardé (cache conservé). Relance plus tard.")
+                    save_backfill_state(state)
+                    self.update_progress((added_so_far + skipped_so_far) / total * 100 if total else 0, "⏳ Quota atteint - en pause")
+                    return
+
+                except ServiceOverloadedError as e:
+                    self.log(f"\n🚦 Gemini reste surchargé après {OVERLOAD_MAX_ATTEMPTS} tentatives : {e}")
+                    save_backfill_state(state)
+                    self.update_progress((added_so_far + skipped_so_far) / total * 100 if total else 0, "🚦 Gemini surchargé - en pause")
+                    return
+
+                except StopRequested:
+                    self.log("\n⏸️ Arrêt demandé, cache conservé pour cette vidéo.")
+                    save_backfill_state(state)
+                    self.update_progress((added_so_far + skipped_so_far) / total * 100 if total else 0, "⏸️ En pause (arrêt manuel)")
+                    return
+
+                except Exception as e:
+                    attempts = ch_state["attempts"].get(video["video_id"], 0) + 1
+                    ch_state["attempts"][video["video_id"]] = attempts
+                    save_backfill_state(state)
+                    self.log(f"   ❌ Erreur (essai {attempts}/{MAX_FAILED_ATTEMPTS}) : {e}")
+
+                time.sleep(DELAY_BETWEEN_PAGES)
+
+            self.refresh_stats_display(total, added_so_far, skipped_so_far, 0)
+            self.log(f"\n🎉 Historique terminé : {added_so_far} ajoutée(s), {skipped_so_far} ignorée(s) au total.")
+            self.update_progress(100, "✅ Terminé")
+
+        except Exception as e:
+            self.log(f"❌ Erreur inattendue : {e}\n{traceback.format_exc()}")
+            self.update_progress(0, "Erreur")
+        finally:
+            self.start_btn.configure(state="normal", text="🚀 Lancer / Reprendre")
+            self.retry_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled", text="⏸️ Arrêter")
+            self.app_lock.release("history")
+
+
+# ============================================================
 # FENÊTRE PRINCIPALE
 # ============================================================
 
@@ -1608,9 +1993,11 @@ class App(ctk.CTk):
 
         tab1 = tabview.add("🎬 Ajouter une vidéo")
         tab2 = tabview.add("🔄 Migration Groq → Gemini")
+        tab3 = tabview.add("📺 Historique des chaînes")
 
         AddVideoTab(tab1, app_lock).pack(fill="both", expand=True)
         MigrationTab(tab2, app_lock).pack(fill="both", expand=True)
+        HistoryTab(tab3, app_lock).pack(fill="both", expand=True)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
