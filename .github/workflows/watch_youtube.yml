@@ -1,0 +1,34 @@
+name: Surveillance YouTube quotidienne
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # tous les jours à 7h UTC — ajuste l'heure si besoin
+  workflow_dispatch: {}     # bouton "Run workflow" pour lancer manuellement
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer ffmpeg et yt-dlp
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install -U yt-dlp google-genai requests python-dotenv customtkinter
+
+      - name: Installer Deno (requis par yt-dlp pour YouTube)
+        run: curl -fsSL https://deno.land/install.sh | sh -s -- -y
+      - run: echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Lancer la surveillance
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHANNELS_DATABASE_ID: ${{ secrets.CHANNELS_DATABASE_ID }}
+        run: python watch_youtube.py
