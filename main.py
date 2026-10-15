@@ -49,7 +49,7 @@ DELAY_BETWEEN_PAGES = 3
 MAX_FAILED_ATTEMPTS = 3
 MAX_PAGES_FOR_MATCHING = 5  # nb de pages existantes envoyées à Gemini pour la comparaison de sujet
 
-OVERLOAD_MAX_ATTEMPTS = 6
+OVERLOAD_MAX_ATTEMPTS = 3
 OVERLOAD_BASE_DELAY = 15
 OVERLOAD_MAX_DELAY = 240
 
@@ -476,11 +476,14 @@ def _domain_label(url):
 
 def _content_blocks(summary, a_retenir, transcription, all_sources, updated=False):
     suffix = " (mis à jour)" if updated else ""
+    safe_summary = (summary or "")[:2000]
+    safe_a_retenir = (a_retenir or "")[:2000]
+    safe_transcription = (transcription or "")[:2000]
     blocks = [
         {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"📝 Synthèse{suffix}"}}]}},
-        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": summary}}]}},
+        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": safe_summary}}]}},
         {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"⭐ À retenir{suffix}"}}]}},
-        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": a_retenir or ""}}]}},
+        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": safe_a_retenir}}]}},
         {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "🔗 Sources"}}]}},
     ]
     for src in all_sources:
@@ -490,7 +493,7 @@ def _content_blocks(summary, a_retenir, transcription, all_sources, updated=Fals
         })
     blocks += [
         {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"📄 Transcription complète{suffix}"}}]}},
-        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": transcription[:2000]}}]}}
+        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": safe_transcription}}]}}
     ]
     return blocks
 
@@ -967,11 +970,13 @@ def analyze_full_video_cached(work_id, video_path, video_title, description, cap
         if not uploaded:
             sujets, transcription = [{"resume": "Résumé non disponible", "titre": video_title or "Vidéo", "a_retenir": "Pas de partie à retenir."}], ""
         else:
-            sujets, transcription = analyze_single_chunk_as_full_video(uploaded, captions_text, description, media_resolution, log_fn, stop_event)
             try:
-                gemini_client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
+                sujets, transcription = analyze_single_chunk_as_full_video(uploaded, captions_text, description, media_resolution, log_fn, stop_event)
+            finally:
+                try:
+                    gemini_client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
 
         state["chunks"][key] = {"sujets": sujets, "transcription_propre": transcription}
         save_work_state(work_id, state)
@@ -989,11 +994,13 @@ def analyze_full_video_cached(work_id, video_path, video_title, description, cap
         if not uploaded:
             result = {"resume_partie": "", "points_cles": [], "transcription_propre": ""}
         else:
-            result = analyze_video_chunk(uploaded, i, total_chunks, captions_text, media_resolution, log_fn, stop_event)
             try:
-                gemini_client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
+                result = analyze_video_chunk(uploaded, i, total_chunks, captions_text, media_resolution, log_fn, stop_event)
+            finally:
+                try:
+                    gemini_client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
         state["chunks"][key] = result
         save_work_state(work_id, state)
 

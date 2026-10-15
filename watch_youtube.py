@@ -15,6 +15,9 @@ import os
 import sys
 import time
 import threading
+import re
+import json
+import subprocess
 import xml.etree.ElementTree as ET
 import requests
 
@@ -122,9 +125,6 @@ def create_placeholder_page(video_url, video_title, data_source_id):
 def get_channel_id(channel_url):
     """Résout un ID de chaîne (UCxxxx) à partir de n'importe quel lien YouTube
     (handle @nom, URL /channel/, /c/, /user/...)."""
-    import re
-    import subprocess
-    import json as _json
 
     m = re.search(r"/channel/(UC[0-9A-Za-z_-]{22})", channel_url or "")
     if m:
@@ -135,7 +135,7 @@ def get_channel_id(channel_url):
             ["yt-dlp", "-J", "--flat-playlist", "--playlist-items", "1", channel_url],
             capture_output=True, text=True, check=True, timeout=30
         )
-        data = _json.loads(result.stdout)
+        data = json.loads(result.stdout)
         return data.get("channel_id") or data.get("uploader_id")
     except Exception as e:
         log(f"   ⚠️ Impossible de résoudre l'ID de la chaîne pour {channel_url} : {e}")
@@ -305,7 +305,6 @@ def run():
             update_channel_last_seen(channel["page_id"], entries[0]["video_id"])
             continue
 
-        seen_ids = {c["video_id"] for c in channels} if False else None  # (placeholder, non utilisé)
         new_entries = []
         for entry in entries:
             if entry["video_id"] == channel["last_video_id"]:
